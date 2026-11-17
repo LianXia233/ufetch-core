@@ -59,6 +59,16 @@ fn run_install(cache: &Path, fake: &Path) -> std::process::ExitStatus {
         .expect("run ufetch install")
 }
 
+fn run_prepare(cache: &Path) -> std::process::ExitStatus {
+    Command::new(env!("CARGO_BIN_EXE_ufetch"))
+        .arg("prepare-install")
+        .arg("apk-1")
+        .env("UFETCH_HOME", cache)
+        .env("UFETCH_LOG", "off")
+        .status()
+        .expect("run ufetch prepare-install")
+}
+
 fn run_install_ok(cache: &Path, args: &[&str]) -> std::process::ExitStatus {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ufetch"));
     command.arg("install-ok").args(args);
@@ -122,12 +132,10 @@ fn install_ok_without_id_uses_pending_marker_and_is_idempotent() {
     let cache = root.join("cache");
     let package = cache.join("pkg.apk");
     write_task(&cache, &package);
-    let pending = serde_json::json!({
-        "task_id": "apk-1",
-        "package": package,
-        "started_at": 1
-    });
-    fs::write(cache.join("pending-install.json"), pending.to_string()).expect("pending");
+    let status = run_prepare(&cache);
+    assert!(status.success());
+    assert!(cache.join("pending-install.json").exists());
+    assert!(package.exists());
 
     let status = run_install_ok(&cache, &[]);
     assert!(status.success());
@@ -151,4 +159,27 @@ fn install_ok_without_pending_is_a_successful_noop() {
     fs::create_dir_all(&cache).expect("cache");
     let status = run_install_ok(&cache, &[]);
     assert!(status.success());
+}
+
+#[test]
+#[cfg(unix)]
+fn auto_remove_false_keeps_package_and_clears_pending() {
+    let root = temp_root("keep");
+    let cache = root.join("cache");
+    let package = cache.join("pkg.apk");
+    write_task(&cache, &package);
+    fs::write(cache.join("settings.toml"), "auto_remove = false\n").expect("settings");
+    let fake = root.join("apk");
+    let log = root.join("apk.log");
+    fake_tool(&fake, &log, 0);
+
+    let status = run_install(&cache, &fake);
+    assert!(status.success());
+    assert!(package.exists());
+    assert!(!cache.join("pending-install.json").exists());
+    assert!(
+        fs::read_to_string(cache.join("tasks.json"))
+            .expect("tasks")
+            .contains("apk-1")
+    );
 }

@@ -29,6 +29,7 @@ USAGE:
     ufetch start|pause|resume|cancel <ID> [--control-file <PATH>]
     ufetch delete <ID> [--keep-file]
     ufetch install <ID> [--keep-file]
+    ufetch prepare-install <ID>
     ufetch install-ok [ID]
     ufetch cache [list|clear] [--json]
     ufetch config [--json]
@@ -107,6 +108,7 @@ async fn dispatch(args: &[String], settings: &Settings) -> Result<(), Error> {
         "start" | "pause" | "resume" | "cancel" => cmd_control(&args[0], &args[1..], settings),
         "delete" => cmd_delete(&args[1..], settings, false).await,
         "install" => cmd_install(&args[1..], settings),
+        "prepare-install" => cmd_prepare_install(&args[1..], settings),
         "install-ok" => cmd_install_ok(&args[1..], settings).await,
         "cache" => cmd_cache(&args[1..], settings),
         "config" => cmd_config(&args[1..], settings),
@@ -409,6 +411,42 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// 插件自己执行 apk/opkg 前先登记待清理标记。
+fn cmd_prepare_install(args: &[String], settings: &Settings) -> Result<(), Error> {
+    let id = args
+        .first()
+        .ok_or_else(|| Error::Usage("prepare-install: missing task ID".into()))?;
+    let record = registry(settings)
+        .get(id)
+        .ok_or_else(|| Error::Usage(format!("unknown task `{id}`")))?;
+    if record.state != "completed" {
+        return Err(Error::Usage(format!(
+            "task `{id}` is `{}`, not completed",
+            record.state
+        )));
+    }
+    let package = record
+        .artifact
+        .clone()
+        .or_else(|| {
+            record
+                .file_name
+                .as_ref()
+                .map(|name| settings.cache_dir.join(name))
+        })
+        .ok_or_else(|| Error::Install(format!("task `{id}` has no artifact")))?;
+    if !package.is_file() {
+        return Err(Error::Install(format!(
+            "package not found: {}",
+            package.display()
+        )));
+    }
+    write_pending(settings, id, &package)
+        .map_err(|error| Error::Install(format!("cannot write pending marker: {error}")))?;
+    println!("pending cleanup for task `{id}`");
+    Ok(())
+}
+
 /// 安装已下载的 `.apk` / `.ipk`；成功后按 `auto_remove` 清掉任务。
 fn cmd_install(args: &[String], settings: &Settings) -> Result<(), Error> {
     let id = args
@@ -508,6 +546,7 @@ fn cmd_install(args: &[String], settings: &Settings) -> Result<(), Error> {
         purge_task(settings, &record, false)?;
         println!("installed, task `{id}` removed");
     } else {
+        clear_pending(settings, id);
         println!("installed, task `{id}` kept (auto_remove/--keep-file)");
     }
     Ok(())

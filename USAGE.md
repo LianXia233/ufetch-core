@@ -116,6 +116,7 @@ ufetch start <ID>
 | `ufetch status <ID> [--json]` | 查看单个任务详情与产物路径 |
 | `ufetch delete <ID> [--keep-file]` | 删除任务记录与产物；`--keep-file` 只删记录 |
 | `ufetch install <ID> [--keep-file]` | 自动识别 apk/opkg 并安装，成功后删除任务与产物 |
+| `ufetch prepare-install <ID>` | 插件自己调用 apk/opkg 前登记待清理标记 |
 | `ufetch install-ok [ID]` | 安装完成后清理；省略 ID 时使用 `pending-install.json`，无标记/已清理也返回成功 |
 | `ufetch cache [list|clear]` | 查看或清空环形缓存 |
 | `ufetch config [--json]` | 查看 TOML 设置 |
@@ -372,6 +373,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 - 下载进程在启动、每次进度 tick、终态时更新它；`ufetch list` 每次重新读盘。
+- `prepare-install` 只写标记、不动包，适合插件自己执行 apk/opkg 的自更新流程；
+  安装结束后由新版本执行 `ufetch install-ok` 收尾。
 - `install` 按扩展名选择安装器：`.apk` → `apk add --allow-untrusted`（OpenWrt 25.12+），
   `.ipk` → `opkg install`（24.10 及更早）；进程超时由 `install_timeout_secs` 控制，失败时保留任务与包。
   `--allow-untrusted` 只绕过 apk 的签名检查，自更新仍应在下载阶段用 `--checksum` 校验包内容。
@@ -399,14 +402,16 @@ ufetch https://example.com/plugin.apk -f plugin.apk
 # 2A. 交给内核安装：成功且进程存活时自动清理
 ufetch install <ID>
 
-# 2B. 或由插件自己用 apk/opkg 安装
+# 2B. 或由插件自己用 apk/opkg 安装：先登记，再安装
+ufetch prepare-install <ID>
 apk add --allow-untrusted /tmp/ufetch/plugin.apk
 
 # 3. 新版本启动后收尾：可带 ID，也可省略 ID 使用待清理标记
 ufetch install-ok
 ```
 
-- postinst 建议用绝对路径 `/usr/bin/ufetch install-ok`，避免 PATH 被精简。
+- postinst 建议用绝对路径 `/usr/bin/ufetch install-ok`，避免 PATH 被精简；
+  并保持 `UFETCH_HOME` 与下载时一致（未设置时为 `/tmp/ufetch`），否则找不到任务表和标记。
 - 新包里的 `ufetch` 替换旧文件不影响正在运行的旧进程（Linux 按 inode 执行）；
   但 postinst 重启插件时旧进程可能被终止，所以第 3 步应由新版本/postinst 执行。
 - `install-ok` 不依赖包管理器，只操作 `/tmp/ufetch`；重复调用、无待清理标记都返回成功，

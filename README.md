@@ -58,6 +58,7 @@ ufetch list
 ufetch pause <id>          # 或 resume / cancel / start
 ufetch status <id>
 ufetch install <id>        # 自动调用 apk/opkg 安装，成功后删除任务
+ufetch prepare-install <id> # 插件自己装 apk/opkg 前先登记收尾
 ufetch install-ok <id>     # 插件自己安装完成后，仅做清理
 ufetch install-ok          # 自更新替换二进制后，用待清理标记收尾
 ```
