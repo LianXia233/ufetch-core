@@ -115,7 +115,8 @@ ufetch start <ID>
 | `ufetch list [--json]` | 列出任务（ID、状态、百分比、大小、文件名） |
 | `ufetch status <ID> [--json]` | 查看单个任务详情与产物路径 |
 | `ufetch delete <ID> [--keep-file]` | 删除任务记录与产物；`--keep-file` 只删记录 |
-| `ufetch install-ok <ID>` | 插件安装成功后调用：删除产物、侧车、状态/控制文件与任务 |
+| `ufetch install <ID> [--keep-file]` | 自动识别 apk/opkg 并安装，成功后删除任务与产物 |
+| `ufetch install-ok <ID>` | 插件自己安装完成后调用：只删除产物、侧车、状态/控制文件与任务 |
 | `ufetch cache [list|clear]` | 查看或清空环形缓存 |
 | `ufetch config [--json]` | 查看 TOML 设置 |
 | `ufetch config set <K=V>...` | 修改设置并落盘 |
@@ -371,7 +372,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 - 下载进程在启动、每次进度 tick、终态时更新它；`ufetch list` 每次重新读盘。
-- `install-ok` 在 `auto_remove=true` 时删除记录与产物；设为 `false` 则保留，便于排查。
+- `install` 按扩展名选择安装器：`.apk` → `apk add --allow-untrusted`（OpenWrt 25.12+），
+  `.ipk` → `opkg install`（24.10 及更早）；进程超时由 `install_timeout_secs` 控制，失败时保留任务与包。
+  `--allow-untrusted` 只绕过 apk 的签名检查，自更新仍应在下载阶段用 `--checksum` 校验包内容。
+- `install-ok` 用于插件自己安装的流程，在 `auto_remove=true` 时删除记录与产物；
+  设为 `false` 则保留，便于排查。
 - `delete` 是手动清理；`cancel` 只停任务，默认保留半成品便于续传。
 
 ### 6.3 日志
@@ -404,6 +409,7 @@ max_retries = 3
 connect_timeout_secs = 20
 slow_guard = true
 auto_remove = true
+install_timeout_secs = 120
 ```
 
 | 键 | 默认 | 说明 |
@@ -421,6 +427,7 @@ auto_remove = true
 | `connect_timeout_secs` | `20` | 建连超时 |
 | `slow_guard` | `true` | 32 KB/s × 15 s 慢速保护 |
 | `auto_remove` | `true` | 安装成功后自动删除任务 |
+| `install_timeout_secs` | `120` | 调用 apk/opkg 安装的超时时间 |
 
 命令行参数（如 `-n`、`-l`、`--stall-secs`）优先于配置文件。
 
@@ -441,10 +448,11 @@ cp -r /path/to/ufetch-core/openwrt package/ufetch-core
 make package/ufetch-core/compile V=s
 ```
 
-包内会安装 `/usr/bin/ufetch`，依赖 `ca-bundle`。若固件没有 CA 包，可在构建时
+包内会安装 `/usr/bin/ufetch`，依赖 `ca-bundle`。OpenWrt 25.12+ 的 apk 与旧版 opkg
+都由 `ufetch install` 自动识别，无需插件再判断包管理器。若固件没有 CA 包，可在构建时
 启用 crate 的 `webpki-roots` 特性（默认已启用内置根证书）。
 
-### 6.1 procd 启动示例
+### 8.1 procd 启动示例
 
 ```sh
 #!/bin/sh /etc/rc.common
@@ -462,11 +470,12 @@ start_service() {
 }
 ```
 
-### 6.2 LuCI 读取与下发
+### 8.2 LuCI 读取与下发
 
 - 读 `/tmp/ufetch/status.json` 显示百分比、速度、`active/connections`；
 - 向 `/tmp/ufetch/ctl.json` 写 `{"cmd":"pause"}` 即可暂停，无需 ubus 接口；
-- 升级成功后由插件脚本校验 `.apk` / `.ipk` 并调用 opkg。
+- 升级成功后可直接调用 `ufetch install <id>`：OpenWrt 25.12+ 走 `apk`，旧版走 `opkg`；
+  安装失败会保留任务和包，便于重试。
 
 ## 9. 行为与限制
 

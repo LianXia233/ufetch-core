@@ -43,6 +43,8 @@ pub struct Settings {
     pub slow_guard: bool,
     /// 安装成功后自动删除任务与产物。
     pub auto_remove: bool,
+    /// 调用 apk/opkg 安装的超时秒数。
+    pub install_timeout_secs: u64,
 }
 
 impl Default for Settings {
@@ -61,6 +63,7 @@ impl Default for Settings {
             connect_timeout_secs: 20,
             slow_guard: true,
             auto_remove: true,
+            install_timeout_secs: 120,
         }
     }
 }
@@ -153,6 +156,7 @@ impl Settings {
             "connect_timeout_secs" => self.connect_timeout_secs = parse_u64(value)?,
             "slow_guard" => self.slow_guard = parse_bool(value)?,
             "auto_remove" => self.auto_remove = parse_bool(value)?,
+            "install_timeout_secs" => self.install_timeout_secs = parse_u64(value)?,
             other => return Err(format!("unknown setting `{other}`")),
         }
         Ok(())

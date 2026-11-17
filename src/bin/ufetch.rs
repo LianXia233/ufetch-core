@@ -9,13 +9,13 @@
 //! ```
 
 use std::io::Write;
-use std::path::PathBuf;
-use std::process::ExitCode;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
+use std::time::{Duration, Instant};
 
 use ufetch_core::{
     CacheEntry, CacheStore, DownloadError, DownloadManager, DownloadRequest, ManagerConfig,
-    Progress, Settings, TaskRegistry, TaskState, default_home, human_bytes, now_secs,
+    Progress, Settings, TaskRecord, TaskRegistry, TaskState, default_home, human_bytes, now_secs,
     write_control,
 };
 
@@ -28,6 +28,7 @@ USAGE:
     ufetch status <ID> [--json]
     ufetch start|pause|resume|cancel <ID> [--control-file <PATH>]
     ufetch delete <ID> [--keep-file]
+    ufetch install <ID> [--keep-file]
     ufetch install-ok <ID>
     ufetch cache [list|clear] [--json]
     ufetch config [--json]
@@ -35,7 +36,7 @@ USAGE:
     ufetch log [--tail <N>]
 
 OPTIONS:
-    -o, --output-dir <DIR>     保存目录（默认当前目录）
+    -o, --output-dir <DIR>     保存目录（默认缓存目录）
     -f, --file-name <NAME>     指定文件名
     -n, --connections <N>      并发连接数（0 = 自适应，默认 0）
     -l, --limit <RATE>         限速，如 512K / 2M（默认不限）
@@ -80,12 +81,17 @@ async fn main() -> ExitCode {
             eprintln!("error: {}", error.summary());
             ExitCode::FAILURE
         }
+        Err(Error::Install(message)) => {
+            eprintln!("error: {message}");
+            ExitCode::FAILURE
+        }
     }
 }
 
 enum Error {
     Usage(String),
     Download(DownloadError),
+    Install(String),
 }
 
 impl From<DownloadError> for Error {
@@ -100,6 +106,7 @@ async fn dispatch(args: &[String], settings: &Settings) -> Result<(), Error> {
         "status" => cmd_status(&args[1..], settings),
         "start" | "pause" | "resume" | "cancel" => cmd_control(&args[0], &args[1..], settings),
         "delete" => cmd_delete(&args[1..], settings, false).await,
+        "install" => cmd_install(&args[1..], settings),
         "install-ok" => cmd_delete(&args[1..], settings, true).await,
         "cache" => cmd_cache(&args[1..], settings),
         "config" => cmd_config(&args[1..], settings),
@@ -246,17 +253,199 @@ async fn cmd_delete(
         }
     }
 
+    purge_task(settings, &record, keep_file)?;
+    println!("task `{id}` removed");
+    Ok(())
+}
+
+fn purge_task(settings: &Settings, record: &TaskRecord, keep_file: bool) -> Result<(), Error> {
     let cache = CacheStore::new(
         settings.cache_dir.clone(),
         settings.cache_capacity_mb * 1024 * 1024,
         settings.cache_max_items,
     );
-    cache.remove(id, !keep_file);
+    cache.remove(&record.id, !keep_file);
     if !keep_file {
-        remove_task_files(&record);
+        remove_task_files(record);
     }
-    tasks.remove(id).map_err(Error::Usage)?;
-    println!("task `{id}` removed");
+    registry(settings)
+        .remove(&record.id)
+        .map_err(Error::Usage)?;
+    Ok(())
+}
+
+/// OpenWrt 24.10+ 用 apk，旧版本用 opkg。
+#[derive(Copy, Clone, Debug)]
+enum Installer {
+    Apk,
+    Opkg,
+}
+
+impl Installer {
+    fn detect(path: &Path) -> Self {
+        match path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("apk") => Self::Apk,
+            Some("ipk") => Self::Opkg,
+            _ if Self::Apk.tool().is_some() => Self::Apk,
+            _ => Self::Opkg,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Apk => "apk",
+            Self::Opkg => "opkg",
+        }
+    }
+
+    fn env_key(self) -> &'static str {
+        match self {
+            Self::Apk => "UFETCH_APK",
+            Self::Opkg => "UFETCH_OPKG",
+        }
+    }
+
+    fn candidates(self) -> &'static [&'static str] {
+        match self {
+            Self::Apk => &["/usr/bin/apk", "/sbin/apk", "/bin/apk"],
+            Self::Opkg => &["/usr/bin/opkg", "/bin/opkg", "/sbin/opkg"],
+        }
+    }
+
+    fn tool(self) -> Option<PathBuf> {
+        if let Some(path) = std::env::var_os(self.env_key()) {
+            let path = PathBuf::from(path);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+        for candidate in self.candidates() {
+            let path = PathBuf::from(candidate);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+        find_in_path(self.name())
+    }
+
+    fn command(self, tool: &Path, package: &Path) -> Command {
+        let mut command = Command::new(tool);
+        match self {
+            Self::Apk => {
+                command.arg("add").arg("--allow-untrusted").arg(package);
+            }
+            Self::Opkg => {
+                command.arg("install").arg(package);
+            }
+        }
+        command
+    }
+}
+
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&paths) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// 安装已下载的 `.apk` / `.ipk`；成功后按 `auto_remove` 清掉任务。
+fn cmd_install(args: &[String], settings: &Settings) -> Result<(), Error> {
+    let id = args
+        .first()
+        .ok_or_else(|| Error::Usage("install: missing task ID".into()))?;
+    let keep_file = has_flag(args, "--keep-file");
+    let record = registry(settings)
+        .get(id)
+        .ok_or_else(|| Error::Usage(format!("unknown task `{id}`")))?;
+    if record.state != "completed" {
+        return Err(Error::Usage(format!(
+            "task `{id}` is `{}`, not completed",
+            record.state
+        )));
+    }
+    let package = record
+        .artifact
+        .clone()
+        .or_else(|| {
+            record
+                .file_name
+                .as_ref()
+                .map(|name| settings.cache_dir.join(name))
+        })
+        .ok_or_else(|| Error::Install(format!("task `{id}` has no artifact")))?;
+    if !package.is_file() {
+        return Err(Error::Install(format!(
+            "package not found: {}",
+            package.display()
+        )));
+    }
+
+    let installer = Installer::detect(&package);
+    let tool = installer.tool().ok_or_else(|| {
+        Error::Install(format!(
+            "{} not found; is this an OpenWrt system?",
+            installer.name()
+        ))
+    })?;
+    println!(
+        "installing {} with {} ...",
+        package.display(),
+        installer.name()
+    );
+    let mut command = installer.command(&tool, &package);
+    let mut child = command
+        .spawn()
+        .map_err(|error| Error::Install(format!("spawn {}: {error}", installer.name())))?;
+    let timeout = Duration::from_secs(settings.install_timeout_secs.max(1));
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Install(format!(
+                    "{} timed out after {}s",
+                    installer.name(),
+                    timeout.as_secs()
+                )));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(error) => {
+                return Err(Error::Install(format!(
+                    "wait for {}: {error}",
+                    installer.name()
+                )));
+            }
+        }
+    };
+    if !status.success() {
+        return Err(Error::Install(format!(
+            "{} failed with {}",
+            installer.name(),
+            status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".into())
+        )));
+    }
+
+    if settings.auto_remove && !keep_file {
+        purge_task(settings, &record, false)?;
+        println!("installed, task `{id}` removed");
+    } else {
+        println!("installed, task `{id}` kept (auto_remove/--keep-file)");
+    }
     Ok(())
 }
 
