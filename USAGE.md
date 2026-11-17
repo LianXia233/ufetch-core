@@ -116,7 +116,7 @@ ufetch start <ID>
 | `ufetch status <ID> [--json]` | 查看单个任务详情与产物路径 |
 | `ufetch delete <ID> [--keep-file]` | 删除任务记录与产物；`--keep-file` 只删记录 |
 | `ufetch install <ID> [--keep-file]` | 自动识别 apk/opkg 并安装，成功后删除任务与产物 |
-| `ufetch install-ok <ID>` | 插件自己安装完成后调用：只删除产物、侧车、状态/控制文件与任务 |
+| `ufetch install-ok [ID]` | 安装完成后清理；省略 ID 时使用 `pending-install.json`，无标记/已清理也返回成功 |
 | `ufetch cache [list|clear]` | 查看或清空环形缓存 |
 | `ufetch config [--json]` | 查看 TOML 设置 |
 | `ufetch config set <K=V>...` | 修改设置并落盘 |
@@ -376,10 +376,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   `.ipk` → `opkg install`（24.10 及更早）；进程超时由 `install_timeout_secs` 控制，失败时保留任务与包。
   `--allow-untrusted` 只绕过 apk 的签名检查，自更新仍应在下载阶段用 `--checksum` 校验包内容。
 - `install-ok` 用于插件自己安装的流程，在 `auto_remove=true` 时删除记录与产物；
-  设为 `false` 则保留，便于排查。
+  省略 ID 时读取 `pending-install.json`；任务已被移除也返回成功。
+- 自更新替换二进制/重启插件后，由新进程执行 `ufetch install-ok` 收尾即可。
 - `delete` 是手动清理；`cancel` 只停任务，默认保留半成品便于续传。
 
-### 6.3 日志
+### 6.3 插件自更新（集成到插件自身）
+
+下载内核可以和插件打进同一个包。自更新时，新包会替换正在运行的 `ufetch`，
+或由 postinst 重启插件，原进程不一定能执行到最后一步，因此安装前会写
+`<缓存>/pending-install.json`：
+
+```json
+{"task_id":"1794946554892-0","package":"/tmp/ufetch/plugin.apk","started_at":1794946554}
+```
+
+推荐流程：
+
+```bash
+# 1. 下载新包（记下任务 ID；也会写进任务表）
+ufetch https://example.com/plugin.apk -f plugin.apk
+
+# 2A. 交给内核安装：成功且进程存活时自动清理
+ufetch install <ID>
+
+# 2B. 或由插件自己用 apk/opkg 安装
+apk add --allow-untrusted /tmp/ufetch/plugin.apk
+
+# 3. 新版本启动后收尾：可带 ID，也可省略 ID 使用待清理标记
+ufetch install-ok
+```
+
+- postinst 建议用绝对路径 `/usr/bin/ufetch install-ok`，避免 PATH 被精简。
+- 新包里的 `ufetch` 替换旧文件不影响正在运行的旧进程（Linux 按 inode 执行）；
+  但 postinst 重启插件时旧进程可能被终止，所以第 3 步应由新版本/postinst 执行。
+- `install-ok` 不依赖包管理器，只操作 `/tmp/ufetch`；重复调用、无待清理标记都返回成功，
+  postinst 可以无条件执行，方便与旧进程同时收尾。
+- 任务表与标记都在缓存目录（OpenWrt 为 tmpfs），升级后、重启前有效；
+  postinst 不要提前清空该目录。
+
+### 6.4 日志
 
 默认 `<缓存目录>/ufetch.log`，只保留最新 **512 KiB**：每次追加后若超限，就截掉旧内容，
 保留尾部 512 KiB。级别由 `UFETCH_LOG` 控制：

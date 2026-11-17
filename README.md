@@ -28,6 +28,8 @@ UFetch-Core 只围绕这三件事设计，不引入 BT / HLS / 数据库 / 插�
   `ufetch install <id>` 自动识别 OpenWrt 新版 `apk`（25.12+）与旧版 `opkg`（24.10 及更早），装完立即删除产物与任务记录；
   插件自己安装时可改用 `ufetch install-ok <id>` 只做清理。
 - **任务表**：`tasks.json` 记录列表、进度、产物路径；`ufetch list` / `status` 可跨进程查看。
+- **自更新收尾**：安装前写 `pending-install.json`；新包替换二进制或重启插件后，
+  `ufetch install-ok`（可不带任务 ID）继续删除旧包与任务，重复调用幂等。
 - **高级设置**：`settings.toml`（TOML + Serde），`ufetch config set key=value` 即时生效。
 - **日志**：`<缓存目录>/ufetch.log`，512 KiB 环形保留最新内容，`ufetch log` 直接看尾部。
 
@@ -57,6 +59,7 @@ ufetch pause <id>          # 或 resume / cancel / start
 ufetch status <id>
 ufetch install <id>        # 自动调用 apk/opkg 安装，成功后删除任务
 ufetch install-ok <id>     # 插件自己安装完成后，仅做清理
+ufetch install-ok          # 自更新替换二进制后，用待清理标记收尾
 ```
 
 也可以直接写控制文件：

@@ -29,7 +29,7 @@ USAGE:
     ufetch start|pause|resume|cancel <ID> [--control-file <PATH>]
     ufetch delete <ID> [--keep-file]
     ufetch install <ID> [--keep-file]
-    ufetch install-ok <ID>
+    ufetch install-ok [ID]
     ufetch cache [list|clear] [--json]
     ufetch config [--json]
     ufetch config set <KEY=VALUE>...
@@ -107,7 +107,7 @@ async fn dispatch(args: &[String], settings: &Settings) -> Result<(), Error> {
         "start" | "pause" | "resume" | "cancel" => cmd_control(&args[0], &args[1..], settings),
         "delete" => cmd_delete(&args[1..], settings, false).await,
         "install" => cmd_install(&args[1..], settings),
-        "install-ok" => cmd_delete(&args[1..], settings, true).await,
+        "install-ok" => cmd_install_ok(&args[1..], settings).await,
         "cache" => cmd_cache(&args[1..], settings),
         "config" => cmd_config(&args[1..], settings),
         "log" => cmd_log(&args[1..]),
@@ -219,9 +219,14 @@ async fn cmd_delete(
         .ok_or_else(|| Error::Usage("delete: missing task ID".into()))?;
     let keep_file = has_flag(args, "--keep-file");
     let tasks = registry(settings);
-    let mut record = tasks
-        .get(id)
-        .ok_or_else(|| Error::Usage(format!("unknown task `{id}`")))?;
+    let Some(mut record) = tasks.get(id) else {
+        if require_completed {
+            clear_pending(settings, id);
+            println!("task `{id}` already removed");
+            return Ok(());
+        }
+        return Err(Error::Usage(format!("unknown task `{id}`")));
+    };
     if require_completed && record.state != "completed" {
         return Err(Error::Usage(format!(
             "task `{id}` is `{}`, not completed",
@@ -271,10 +276,56 @@ fn purge_task(settings: &Settings, record: &TaskRecord, keep_file: bool) -> Resu
     registry(settings)
         .remove(&record.id)
         .map_err(Error::Usage)?;
+    clear_pending(settings, &record.id);
     Ok(())
 }
 
-/// OpenWrt 24.10+ 用 apk，旧版本用 opkg。
+/// 自更新安装前的待清理标记；新包替换旧二进制后仍可据此收尾。
+fn pending_path(settings: &Settings) -> PathBuf {
+    settings.cache_dir.join("pending-install.json")
+}
+
+fn write_pending(settings: &Settings, task_id: &str, package: &Path) -> std::io::Result<()> {
+    let body = serde_json::json!({
+        "task_id": task_id,
+        "package": package,
+        "started_at": now_secs(),
+    });
+    std::fs::write(pending_path(settings), body.to_string())
+}
+
+fn read_pending(settings: &Settings) -> Option<String> {
+    let text = std::fs::read_to_string(pending_path(settings)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value.get("task_id")?.as_str().map(ToString::to_string)
+}
+
+fn clear_pending(settings: &Settings, task_id: &str) {
+    if read_pending(settings).as_deref() == Some(task_id) {
+        let _ = std::fs::remove_file(pending_path(settings));
+    }
+}
+
+/// `install-ok` 既支持显式任务 ID，也支持自更新后无 ID 的收尾。
+async fn cmd_install_ok(args: &[String], settings: &Settings) -> Result<(), Error> {
+    let id = match args.first() {
+        Some(id) => id.clone(),
+        None => match read_pending(settings) {
+            Some(id) => id,
+            None => {
+                println!("no pending install");
+                return Ok(());
+            }
+        },
+    };
+    let mut forwarded = vec![id];
+    if has_flag(args, "--keep-file") {
+        forwarded.push("--keep-file".into());
+    }
+    cmd_delete(&forwarded, settings, true).await
+}
+
+/// OpenWrt 25.12+ 用 apk，旧版本用 opkg。
 #[derive(Copy, Clone, Debug)]
 enum Installer {
     Apk,
@@ -402,10 +453,20 @@ fn cmd_install(args: &[String], settings: &Settings) -> Result<(), Error> {
         package.display(),
         installer.name()
     );
+    if let Err(error) = write_pending(settings, id, &package) {
+        eprintln!("warning: cannot write pending marker: {error}");
+    }
     let mut command = installer.command(&tool, &package);
-    let mut child = command
-        .spawn()
-        .map_err(|error| Error::Install(format!("spawn {}: {error}", installer.name())))?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            clear_pending(settings, id);
+            return Err(Error::Install(format!(
+                "spawn {}: {error}",
+                installer.name()
+            )));
+        }
+    };
     let timeout = Duration::from_secs(settings.install_timeout_secs.max(1));
     let started = Instant::now();
     let status = loop {
@@ -414,6 +475,7 @@ fn cmd_install(args: &[String], settings: &Settings) -> Result<(), Error> {
             Ok(None) if started.elapsed() >= timeout => {
                 let _ = child.kill();
                 let _ = child.wait();
+                clear_pending(settings, id);
                 return Err(Error::Install(format!(
                     "{} timed out after {}s",
                     installer.name(),
@@ -422,6 +484,7 @@ fn cmd_install(args: &[String], settings: &Settings) -> Result<(), Error> {
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(100)),
             Err(error) => {
+                clear_pending(settings, id);
                 return Err(Error::Install(format!(
                     "wait for {}: {error}",
                     installer.name()
@@ -430,6 +493,7 @@ fn cmd_install(args: &[String], settings: &Settings) -> Result<(), Error> {
         }
     };
     if !status.success() {
+        clear_pending(settings, id);
         return Err(Error::Install(format!(
             "{} failed with {}",
             installer.name(),

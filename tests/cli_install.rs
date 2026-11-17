@@ -59,6 +59,16 @@ fn run_install(cache: &Path, fake: &Path) -> std::process::ExitStatus {
         .expect("run ufetch install")
 }
 
+fn run_install_ok(cache: &Path, args: &[&str]) -> std::process::ExitStatus {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ufetch"));
+    command.arg("install-ok").args(args);
+    command
+        .env("UFETCH_HOME", cache)
+        .env("UFETCH_LOG", "off")
+        .status()
+        .expect("run ufetch install-ok")
+}
+
 #[test]
 #[cfg(unix)]
 fn apk_install_uses_allow_untrusted_and_removes_task() {
@@ -76,6 +86,10 @@ fn apk_install_uses_allow_untrusted_and_removes_task() {
     assert_eq!(
         fs::read_to_string(cache.join("tasks.json")).expect("tasks"),
         "[]"
+    );
+    assert!(
+        !cache.join("pending-install.json").exists(),
+        "pending marker must be cleared"
     );
     let args = fs::read_to_string(&log).expect("log");
     assert!(args.contains("add"));
@@ -99,4 +113,42 @@ fn failed_apk_install_keeps_task_and_package() {
     assert!(package.exists(), "failed install must keep package");
     let tasks = fs::read_to_string(cache.join("tasks.json")).expect("tasks");
     assert!(tasks.contains("apk-1"));
+}
+
+#[test]
+#[cfg(unix)]
+fn install_ok_without_id_uses_pending_marker_and_is_idempotent() {
+    let root = temp_root("pending");
+    let cache = root.join("cache");
+    let package = cache.join("pkg.apk");
+    write_task(&cache, &package);
+    let pending = serde_json::json!({
+        "task_id": "apk-1",
+        "package": package,
+        "started_at": 1
+    });
+    fs::write(cache.join("pending-install.json"), pending.to_string()).expect("pending");
+
+    let status = run_install_ok(&cache, &[]);
+    assert!(status.success());
+    assert!(!package.exists());
+    assert!(!cache.join("pending-install.json").exists());
+    assert_eq!(
+        fs::read_to_string(cache.join("tasks.json")).expect("tasks"),
+        "[]"
+    );
+
+    // 包里的 postinst 与旧进程同时收尾时，第二次必须成功返回。
+    let status = run_install_ok(&cache, &["apk-1"]);
+    assert!(status.success());
+}
+
+#[test]
+#[cfg(unix)]
+fn install_ok_without_pending_is_a_successful_noop() {
+    let root = temp_root("no-pending");
+    let cache = root.join("cache");
+    fs::create_dir_all(&cache).expect("cache");
+    let status = run_install_ok(&cache, &[]);
+    assert!(status.success());
 }
