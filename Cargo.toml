@@ -1,0 +1,72 @@
+[package]
+name = "ufetch-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "面向 OpenWrt 插件自更新的 HTTP 下载内核：动态分段、慢段接管、镜像线路回退、断点续传、限速与校验"
+license = "LGPL-3.0-or-later"
+keywords = ["download", "http", "multipart", "tokio", "openwrt"]
+categories = ["network-programming", "asynchronous"]
+
+[lib]
+name = "ufetch_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ufetch"
+path = "src/bin/ufetch.rs"
+
+[dependencies]
+tokio = { version = "1.45", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "fs",
+    "io-util",
+    "sync",
+] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "stream",
+    "rustls-tls",
+    "http2",
+    "charset",
+] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls-native-certs = { version = "0.8", optional = true }
+webpki-roots = { version = "1", optional = true }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+base64 = "0.22"
+encoding_rs = "0.8"
+sha2 = "0.10"
+sha1 = "0.10"
+md-5 = "0.10"
+hex = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+
+[features]
+# 默认内置 WebPKI 根证书：路由器上常常没有 ca-bundle，内置根最稳。
+default = ["webpki-roots"]
+# 使用系统根证书库（OpenWrt 装了 ca-bundle / 系统证书时可用，体积略小）。
+native-roots = ["dep:rustls-native-certs"]
+# 通过 reqwest 的系统代理环境变量（HTTP_PROXY / HTTPS_PROXY）出网。
+system-proxy = ["reqwest/system-proxy", "reqwest/macos-system-configuration"]
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+tokio = { version = "1.45", features = ["full"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+strip = true
+codegen-units = 1
