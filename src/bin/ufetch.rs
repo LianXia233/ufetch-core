@@ -14,8 +14,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use ufetch_core::{
-    DownloadError, DownloadManager, DownloadRequest, EngineConfig, ManagerConfig, Progress,
-    TaskState, human_bytes, write_control,
+    CacheEntry, CacheStore, DownloadError, DownloadManager, DownloadRequest, ManagerConfig,
+    Progress, Settings, TaskRegistry, TaskState, default_home, human_bytes, now_secs,
+    write_control,
 };
 
 const USAGE: &str = "\
@@ -23,7 +24,15 @@ ufetch — HTTP 下载内核 CLI
 
 USAGE:
     ufetch [OPTIONS] <URL>
-    ufetch pause|resume|cancel --control-file <PATH>
+    ufetch list [--json]
+    ufetch status <ID> [--json]
+    ufetch start|pause|resume|cancel <ID> [--control-file <PATH>]
+    ufetch delete <ID> [--keep-file]
+    ufetch install-ok <ID>
+    ufetch cache [list|clear] [--json]
+    ufetch config [--json]
+    ufetch config set <KEY=VALUE>...
+    ufetch log [--tail <N>]
 
 OPTIONS:
     -o, --output-dir <DIR>     保存目录（默认当前目录）
@@ -57,29 +66,10 @@ async fn main() -> ExitCode {
         print!("{USAGE}");
         return ExitCode::SUCCESS;
     }
-
-    // 子命令：pause / resume / cancel
-    if let Some(command) = ["pause", "resume", "cancel"]
-        .iter()
-        .find(|cmd| args[0] == **cmd)
-    {
-        let Some(path) = option_value(&args, "--control-file") else {
-            eprintln!("error: --control-file is required for `{command}`");
-            return ExitCode::from(2);
-        };
-        return match write_control(PathBuf::from(path).as_path(), command) {
-            Ok(()) => {
-                println!("{command} written to {path}");
-                ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("error: {error}");
-                ExitCode::FAILURE
-            }
-        };
-    }
-
-    match run_download(&args).await {
+    let settings = Settings::load();
+    ufetch_core::logger::set_log_file(settings.cache_dir.join("ufetch.log"));
+    ufetch_core::logger::init_from_env();
+    match dispatch(&args, &settings).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(Error::Usage(message)) => {
             eprintln!("error: {message}\n\n{USAGE}");
@@ -104,10 +94,299 @@ impl From<DownloadError> for Error {
     }
 }
 
-async fn run_download(args: &[String]) -> Result<(), Error> {
-    let mut config = EngineConfig::openwrt();
-    let mut manager_config = ManagerConfig::default();
-    let mut output_dir = PathBuf::from(".");
+async fn dispatch(args: &[String], settings: &Settings) -> Result<(), Error> {
+    match args[0].as_str() {
+        "list" => cmd_list(&args[1..], settings),
+        "status" => cmd_status(&args[1..], settings),
+        "start" | "pause" | "resume" | "cancel" => cmd_control(&args[0], &args[1..], settings),
+        "delete" => cmd_delete(&args[1..], settings, false).await,
+        "install-ok" => cmd_delete(&args[1..], settings, true).await,
+        "cache" => cmd_cache(&args[1..], settings),
+        "config" => cmd_config(&args[1..], settings),
+        "log" => cmd_log(&args[1..]),
+        _ => run_download(args, settings).await,
+    }
+}
+
+fn registry(settings: &Settings) -> TaskRegistry {
+    TaskRegistry::new(&settings.cache_dir)
+}
+
+fn cmd_list(args: &[String], settings: &Settings) -> Result<(), Error> {
+    let records = registry(settings).list();
+    if has_flag(args, "--json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&records).unwrap_or_else(|_| "[]".into())
+        );
+        return Ok(());
+    }
+    if records.is_empty() {
+        println!("no tasks");
+        return Ok(());
+    }
+    println!(
+        "{:<22} {:<10} {:>7} {:>10}  FILE",
+        "ID", "STATE", "PERCENT", "SIZE"
+    );
+    for record in records {
+        let size = if record.total > 0 {
+            human_bytes(record.total)
+        } else {
+            human_bytes(record.downloaded)
+        };
+        println!(
+            "{:<22} {:<10} {:>6.1}% {:>10}  {}",
+            record.id,
+            record.state,
+            record.percent,
+            size,
+            record.file_name.as_deref().unwrap_or("-")
+        );
+    }
+    Ok(())
+}
+
+fn cmd_status(args: &[String], settings: &Settings) -> Result<(), Error> {
+    let id = args
+        .first()
+        .ok_or_else(|| Error::Usage("status: missing task ID".into()))?;
+    let record = registry(settings)
+        .get(id)
+        .ok_or_else(|| Error::Usage(format!("unknown task `{id}`")))?;
+    if has_flag(args, "--json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&record).unwrap_or_default()
+        );
+    } else {
+        println!("id:      {}", record.id);
+        println!("state:   {}", record.state);
+        println!("percent: {:.1}%", record.percent);
+        println!(
+            "size:    {}",
+            human_bytes(record.total.max(record.downloaded))
+        );
+        println!("file:    {}", record.file_name.as_deref().unwrap_or("-"));
+        if let Some(path) = record.artifact.as_ref() {
+            println!("path:    {}", path.display());
+        }
+        if let Some(error) = record.error.as_ref() {
+            println!("error:   {error}");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_control(command: &str, args: &[String], settings: &Settings) -> Result<(), Error> {
+    let action = if command == "start" {
+        "resume"
+    } else {
+        command
+    };
+    let explicit = option_value(args, "--control-file").map(PathBuf::from);
+    let path = match explicit {
+        Some(path) => path,
+        None => {
+            let id = args
+                .first()
+                .ok_or_else(|| Error::Usage(format!("{command}: missing task ID")))?;
+            registry(settings)
+                .get(id)
+                .and_then(|record| record.control_file)
+                .ok_or_else(|| Error::Usage(format!("task `{id}` has no control file")))?
+        }
+    };
+    write_control(&path, action).map_err(|error| Error::Usage(error.to_string()))?;
+    println!("{action} -> {}", path.display());
+    Ok(())
+}
+
+async fn cmd_delete(
+    args: &[String],
+    settings: &Settings,
+    require_completed: bool,
+) -> Result<(), Error> {
+    let id = args
+        .first()
+        .ok_or_else(|| Error::Usage("delete: missing task ID".into()))?;
+    let keep_file = has_flag(args, "--keep-file");
+    let tasks = registry(settings);
+    let mut record = tasks
+        .get(id)
+        .ok_or_else(|| Error::Usage(format!("unknown task `{id}`")))?;
+    if require_completed && record.state != "completed" {
+        return Err(Error::Usage(format!(
+            "task `{id}` is `{}`, not completed",
+            record.state
+        )));
+    }
+    if require_completed && !settings.auto_remove {
+        println!("auto_remove=false, task `{id}` kept");
+        return Ok(());
+    }
+    if !require_completed && !is_terminal(&record.state) {
+        if let Some(control) = record.control_file.as_ref() {
+            write_control(control, "cancel").map_err(|error| Error::Usage(error.to_string()))?;
+        }
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            record = tasks
+                .get(id)
+                .ok_or_else(|| Error::Usage(format!("task `{id}` disappeared")))?;
+            if is_terminal(&record.state) {
+                break;
+            }
+        }
+        if !is_terminal(&record.state) {
+            return Err(Error::Usage(format!(
+                "task `{id}` is still `{}`; cancel it first",
+                record.state
+            )));
+        }
+    }
+
+    let cache = CacheStore::new(
+        settings.cache_dir.clone(),
+        settings.cache_capacity_mb * 1024 * 1024,
+        settings.cache_max_items,
+    );
+    cache.remove(id, !keep_file);
+    if !keep_file {
+        remove_task_files(&record);
+    }
+    tasks.remove(id).map_err(Error::Usage)?;
+    println!("task `{id}` removed");
+    Ok(())
+}
+
+fn is_terminal(state: &str) -> bool {
+    matches!(state, "completed" | "failed" | "cancelled")
+}
+
+fn remove_task_files(record: &ufetch_core::TaskRecord) {
+    let dir = record
+        .artifact
+        .as_ref()
+        .and_then(|path| path.parent())
+        .or_else(|| record.status_file.as_ref().and_then(|path| path.parent()))
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    if let Some(path) = record.artifact.as_ref() {
+        let _ = std::fs::remove_file(path);
+    }
+    if let Some(name) = record.file_name.as_ref() {
+        let _ = std::fs::remove_file(dir.join(format!("{name}.ufetch")));
+        let _ = std::fs::remove_file(dir.join(format!("{name}.ufetch.parts.json")));
+    }
+    if let Some(path) = record.status_file.as_ref() {
+        let _ = std::fs::remove_file(path);
+    }
+    if let Some(path) = record.control_file.as_ref() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn cmd_cache(args: &[String], settings: &Settings) -> Result<(), Error> {
+    let store = CacheStore::new(
+        settings.cache_dir.clone(),
+        settings.cache_capacity_mb * 1024 * 1024,
+        settings.cache_max_items,
+    );
+    match args.first().map(String::as_str) {
+        Some("clear") => {
+            let tasks = registry(settings);
+            for entry in store.entries() {
+                if let Some(record) = tasks.get(&entry.task_id) {
+                    remove_task_files(&record);
+                }
+                let _ = tasks.remove(&entry.task_id);
+            }
+            store.clear();
+            println!("cache cleared");
+            Ok(())
+        }
+        _ => {
+            let entries = store.entries();
+            if has_flag(args, "--json") {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".into())
+                );
+            } else if entries.is_empty() {
+                println!("cache is empty");
+            } else {
+                println!("{:<22} {:>10}  PATH", "TASK", "SIZE");
+                for entry in entries {
+                    println!(
+                        "{:<22} {:>10}  {}",
+                        entry.task_id,
+                        human_bytes(entry.bytes),
+                        entry.path.display()
+                    );
+                }
+                println!(
+                    "\n{} / {} used",
+                    human_bytes(store.used_bytes()),
+                    human_bytes(store.capacity_bytes())
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn cmd_config(args: &[String], settings: &Settings) -> Result<(), Error> {
+    if args.first().map(String::as_str) == Some("set") {
+        let mut updated = settings.clone();
+        for pair in &args[1..] {
+            let (key, value) = pair.split_once('=').ok_or_else(|| {
+                Error::Usage(format!("config set: expected KEY=VALUE, got `{pair}`"))
+            })?;
+            updated.set(key, value).map_err(Error::Usage)?;
+        }
+        updated.save().map_err(Error::Usage)?;
+        println!("settings saved to {}", Settings::default_path().display());
+        return Ok(());
+    }
+    if has_flag(args, "--json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(settings).unwrap_or_default()
+        );
+    } else {
+        println!("{}", toml::to_string_pretty(settings).unwrap_or_default());
+    }
+    Ok(())
+}
+
+fn cmd_log(args: &[String]) -> Result<(), Error> {
+    let path = default_home().join("ufetch.log");
+    let tail = option_value(args, "--tail")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(40);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| Error::Usage(format!("cannot read {}: {error}", path.display())))?;
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(tail);
+    for line in &lines[start..] {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|arg| arg == flag)
+}
+
+async fn run_download(args: &[String], settings: &Settings) -> Result<(), Error> {
+    let mut config = settings.apply();
+    let mut manager_config = ManagerConfig {
+        task_dir: settings.cache_dir.clone(),
+        auto_remove: settings.auto_remove,
+        ..ManagerConfig::default()
+    };
+    let mut output_dir = settings.cache_dir.clone();
     let mut file_name = None;
     let mut checksum = None;
     let mut mirrors: Vec<String> = Vec::new();
@@ -177,7 +456,7 @@ async fn run_download(args: &[String]) -> Result<(), Error> {
     }
 
     let url = url.ok_or_else(|| Error::Usage("missing URL".into()))?;
-    manager_config.engine = config.clone();
+    manager_config.engine = config;
 
     let manager = DownloadManager::try_new(manager_config)?;
     let mut request = DownloadRequest::new(url, output_dir)
@@ -199,6 +478,7 @@ async fn run_download(args: &[String]) -> Result<(), Error> {
     }
 
     let task = manager.download(request);
+    let task_id = task.id().to_string();
     let mut progress = task.subscribe();
     let mut last_state = TaskState::Queued;
     let mut printed = false;
@@ -226,6 +506,7 @@ async fn run_download(args: &[String]) -> Result<(), Error> {
                     "{}",
                     serde_json::json!({
                         "event": "done",
+                        "task_id": task_id,
                         "path": outcome.path,
                         "file_name": outcome.file_name,
                         "bytes": outcome.total_bytes,
@@ -252,11 +533,39 @@ async fn run_download(args: &[String]) -> Result<(), Error> {
                     human_bytes(outcome.average_bps) + "/s"
                 );
             }
+            if outcome.path.starts_with(&settings.cache_dir)
+                && outcome.total_bytes <= settings.cache_capacity_mb * 1024 * 1024
+            {
+                let cache = CacheStore::new(
+                    settings.cache_dir.clone(),
+                    settings.cache_capacity_mb * 1024 * 1024,
+                    settings.cache_max_items,
+                );
+                let entry = CacheEntry {
+                    task_id: task_id.clone(),
+                    file_name: outcome.file_name.clone(),
+                    path: outcome.path.clone(),
+                    bytes: outcome.total_bytes,
+                    created_at: now_secs(),
+                };
+                match cache.register(entry) {
+                    Ok(evicted) => {
+                        let tasks = TaskRegistry::new(&settings.cache_dir);
+                        for item in evicted {
+                            let _ = tasks.remove(&item.task_id);
+                        }
+                    }
+                    Err(error) => eprintln!("warning: cache index write failed: {error}"),
+                }
+            }
             Ok(())
         }
         Err(DownloadError::Cancelled) => {
             if json {
-                println!("{}", serde_json::json!({ "event": "cancelled" }));
+                println!(
+                    "{}",
+                    serde_json::json!({ "event": "cancelled", "task_id": task_id })
+                );
             }
             Err(DownloadError::Cancelled.into())
         }
@@ -264,7 +573,7 @@ async fn run_download(args: &[String]) -> Result<(), Error> {
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({ "event": "failed", "error": error.summary() })
+                    serde_json::json!({ "event": "failed", "task_id": task_id, "error": error.summary() })
                 );
             }
             Err(error.into())

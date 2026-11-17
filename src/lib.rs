@@ -46,26 +46,34 @@
 //! # Ok(()) }
 //! ```
 
+pub mod cache;
 pub mod engine;
 pub mod error;
 pub mod file_hash;
+pub(crate) mod fsutil;
 pub mod logger;
 pub mod manager;
 pub mod naming;
 pub mod net_failure;
 pub(crate) mod output;
 pub mod progress;
+pub mod registry;
 pub mod resume;
 pub mod segment_advisor;
+pub mod settings;
 pub mod speed_limiter;
 pub mod speed_meter;
 pub mod task;
 pub(crate) mod temp_file_guard;
 
+pub use cache::{CacheEntry, CacheStore};
 pub use engine::{DownloadOutcome, EngineConfig, SlowGuard};
 pub use error::DownloadError;
+pub use fsutil::default_home;
 pub use manager::{DownloadManager, ManagerConfig, StatusSnapshot, build_client, write_control};
 pub use progress::{Progress, TaskState, human_bytes};
+pub use registry::{TaskRecord, TaskRegistry, now_secs};
 pub use resume::{PartSegment, PartsFile};
 pub use segment_advisor::{AdvisorInput, SegmentAdvice};
+pub use settings::{Settings, parse_rate};
 pub use task::{DownloadRequest, DownloadTask, RunState, TaskControl, apply_mirror};

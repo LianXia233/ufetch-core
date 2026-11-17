@@ -13,7 +13,9 @@ use tokio::sync::{Semaphore, watch};
 
 use crate::engine::{self, DownloadOutcome, EngineConfig, RunResult, SharedProgress};
 use crate::error::DownloadError;
+use crate::fsutil::default_home;
 use crate::progress::{Progress, TaskState};
+use crate::registry::{TaskRecord, TaskRegistry, now_secs};
 use crate::speed_limiter::SpeedLimiter;
 use crate::task::{DownloadRequest, DownloadTask, RunState, TaskControl};
 use crate::{log_error, log_info, log_warn};
@@ -27,6 +29,10 @@ pub struct ManagerConfig {
     pub max_concurrent: usize,
     /// 进度发布间隔。
     pub progress_interval: Duration,
+    /// 任务表与默认状态文件目录。
+    pub task_dir: PathBuf,
+    /// 安装成功后是否自动移除任务（仅记录，删除动作由调用方触发）。
+    pub auto_remove: bool,
 }
 
 impl Default for ManagerConfig {
@@ -35,6 +41,8 @@ impl Default for ManagerConfig {
             engine: EngineConfig::openwrt(),
             max_concurrent: 3,
             progress_interval: Duration::from_millis(500),
+            task_dir: default_home(),
+            auto_remove: true,
         }
     }
 }
@@ -47,6 +55,7 @@ pub struct DownloadManager {
     config: Arc<ManagerConfig>,
     slots: Arc<Semaphore>,
     counter: Arc<AtomicU64>,
+    registry: TaskRegistry,
 }
 
 impl DownloadManager {
@@ -76,6 +85,7 @@ impl DownloadManager {
             client,
             limiter,
             slots: Arc::new(Semaphore::new(config.max_concurrent.max(1))),
+            registry: TaskRegistry::new(&config.task_dir),
             config: Arc::new(config),
             counter: Arc::new(AtomicU64::new(0)),
         })
@@ -94,7 +104,7 @@ impl DownloadManager {
 
     /// 提交一个下载任务，立即返回句柄。
     #[must_use]
-    pub fn download(&self, request: DownloadRequest) -> DownloadTask {
+    pub fn download(&self, mut request: DownloadRequest) -> DownloadTask {
         let id = format!(
             "{}-{}",
             std::time::SystemTime::now()
@@ -103,6 +113,24 @@ impl DownloadManager {
                 .unwrap_or(0),
             self.counter.fetch_add(1, Ordering::Relaxed)
         );
+        if request.status_file.is_none() {
+            request.status_file = Some(self.config.task_dir.join(format!("{id}.status.json")));
+        }
+        if request.control_file.is_none() {
+            request.control_file = Some(self.config.task_dir.join(format!("{id}.ctl.json")));
+        }
+        let record = record_for(
+            &id,
+            &request.url,
+            "queued",
+            None,
+            request.status_file.clone(),
+            request.control_file.clone(),
+            self.config.auto_remove,
+        );
+        if let Err(error) = self.registry.upsert(&record) {
+            log_warn!("[tasks] initial write failed: {error}");
+        }
         let shared = SharedProgress::new(&id);
         let (control, _) = TaskControl::new();
         let (progress_tx, progress_rx) = watch::channel(Progress {
@@ -115,7 +143,12 @@ impl DownloadManager {
         {
             let shared = Arc::clone(&shared);
             let tx = progress_tx.clone();
+            let registry = self.registry.clone();
             let task_id = id.clone();
+            let url = request.url.clone();
+            let status_file = request.status_file.clone();
+            let control_file = request.control_file.clone();
+            let auto_remove = self.config.auto_remove;
             let interval = self.config.progress_interval;
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(interval);
@@ -124,6 +157,17 @@ impl DownloadManager {
                     ticker.tick().await;
                     let snapshot = shared.snapshot(&task_id);
                     let terminal = snapshot.state.is_terminal();
+                    if !terminal {
+                        let _ = registry.upsert(&record_for_progress(
+                            &task_id,
+                            &url,
+                            &snapshot,
+                            None,
+                            status_file.clone(),
+                            control_file.clone(),
+                            auto_remove,
+                        ));
+                    }
                     if tx.send(snapshot).is_err() {
                         return;
                     }
@@ -168,11 +212,15 @@ impl DownloadManager {
         let config = Arc::clone(&self.config);
         let slots = Arc::clone(&self.slots);
         let task_id = id.clone();
+        let registry = self.registry.clone();
         let control_for_task = control.clone();
         let shared_for_task = Arc::clone(&shared);
         let progress_for_task = progress_tx.clone();
 
         let final_status = request.status_file.clone();
+        let final_url = request.url.clone();
+        let final_status_path = request.status_file.clone();
+        let final_control_path = request.control_file.clone();
         let handle = tokio::spawn(async move {
             let permit = match slots.acquire_owned().await {
                 Ok(permit) => permit,
@@ -203,6 +251,43 @@ impl DownloadManager {
                 if let Err(error) = write_status(path, &snapshot) {
                     log_warn!("[status] task {task_id} final write failed: {error}");
                 }
+            }
+            let final_record = match &result {
+                Ok(outcome) => record_for(
+                    &task_id,
+                    &final_url,
+                    "completed",
+                    Some(&shared_for_task.snapshot(&task_id)),
+                    final_status_path.clone(),
+                    final_control_path.clone(),
+                    config.auto_remove,
+                )
+                .with_artifact(outcome.path.clone()),
+                Err(DownloadError::Cancelled) => record_for(
+                    &task_id,
+                    &final_url,
+                    "cancelled",
+                    Some(&shared_for_task.snapshot(&task_id)),
+                    final_status_path.clone(),
+                    final_control_path.clone(),
+                    config.auto_remove,
+                ),
+                Err(error) => {
+                    let mut record = record_for(
+                        &task_id,
+                        &final_url,
+                        "failed",
+                        Some(&shared_for_task.snapshot(&task_id)),
+                        final_status_path.clone(),
+                        final_control_path.clone(),
+                        config.auto_remove,
+                    );
+                    record.error = Some(error.summary());
+                    record
+                }
+            };
+            if let Err(error) = registry.upsert(&final_record) {
+                log_warn!("[tasks] final write failed: {error}");
             }
             match &result {
                 Ok(outcome) => log_info!(
@@ -299,6 +384,60 @@ async fn run_task(
             }
         }
     }
+}
+
+fn record_for(
+    id: &str,
+    url: &str,
+    state: &str,
+    progress: Option<&Progress>,
+    status_file: Option<PathBuf>,
+    control_file: Option<PathBuf>,
+    auto_remove: bool,
+) -> TaskRecord {
+    let now = now_secs();
+    let progress = progress.cloned().unwrap_or_default();
+    TaskRecord {
+        id: id.to_string(),
+        url: url.to_string(),
+        file_name: progress.file_name.clone(),
+        state: state.to_string(),
+        downloaded: progress.downloaded,
+        total: progress.total,
+        percent: progress.percent,
+        speed_bps: progress.speed_bps,
+        connections: progress.connections,
+        active_connections: progress.active_connections,
+        created_at: now,
+        updated_at: now,
+        status_file,
+        control_file,
+        artifact: None,
+        error: None,
+        auto_remove,
+    }
+}
+
+fn record_for_progress(
+    id: &str,
+    url: &str,
+    progress: &Progress,
+    artifact: Option<PathBuf>,
+    status_file: Option<PathBuf>,
+    control_file: Option<PathBuf>,
+    auto_remove: bool,
+) -> TaskRecord {
+    let mut record = record_for(
+        id,
+        url,
+        &progress.state.to_string(),
+        Some(progress),
+        status_file,
+        control_file,
+        auto_remove,
+    );
+    record.artifact = artifact;
+    record
 }
 
 /// 装配 HTTP 客户端。

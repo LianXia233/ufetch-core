@@ -1,8 +1,8 @@
 # UFetch-Core
 
 面向 **OpenWrt 插件自更新**（opkg / apk / LuCI 在线升级）的纯 HTTP 下载内核，Rust + Tokio。
-小体积、无数据库、可续传，支持自适应多连接、慢段接管、镜像回退、限速与校验，
-并能被 LuCI 通过两个 JSON 文件控制。
+小体积、无数据库、可续传，支持自适应多连接、慢段接管、镜像回退、限速与校验；
+默认把完成包落在内存环形缓存里，提供任务列表、暂停/继续/取消/删除与安装后自动清理。
 
 - crate：`ufetch-core`
 - 库：`ufetch_core`
@@ -24,6 +24,11 @@ UFetch-Core 只围绕这三件事设计，不引入 BT / HLS / 数据库 / 插�
 - **镜像回退**：前缀（`https://ghfast.top/`）或 `{url}` 模板，只有网络类失败才换线路。
 - **看门狗与慢速保护**：30 s 无新字节切断重派；32 KB/s × 15 s 判慢速失败，不挂死任务。
 - **可被 LuCI 控制**：状态 JSON + 控制 JSON（`pause` / `resume` / `cancel`），无需 IPC。
+- **内存环形缓存**：默认 `<tmp>/ufetch`（OpenWrt 上是 tmpfs），按总字节与条目数双上限淘汰最旧任务；
+  安装成功后 `ufetch install-ok <id>` 立即删除产物与任务记录。
+- **任务表**：`tasks.json` 记录列表、进度、产物路径；`ufetch list` / `status` 可跨进程查看。
+- **高级设置**：`settings.toml`（TOML + Serde），`ufetch config set key=value` 即时生效。
+- **日志**：`<缓存目录>/ufetch.log`，512 KiB 环形保留最新内容，`ufetch log` 直接看尾部。
 
 ## 快速开始
 
@@ -43,12 +48,21 @@ cargo build --release
   --control-file /tmp/dl/ctl.json
 ```
 
-另一个进程下发控制：
+任务列表、暂停/继续、安装后清理：
 
 ```bash
-echo '{"cmd":"pause"}'  > /tmp/dl/ctl.json
-echo '{"cmd":"resume"}' > /tmp/dl/ctl.json
-echo '{"cmd":"cancel"}' > /tmp/dl/ctl.json
+ufetch list
+ufetch pause <id>          # 或 resume / cancel / start
+ufetch status <id>
+ufetch install-ok <id>     # 插件安装成功后调用，删除任务与缓存文件
+```
+
+也可以直接写控制文件：
+
+```bash
+echo '{"cmd":"pause"}'  > /tmp/ufetch/<id>.ctl.json
+echo '{"cmd":"resume"}' > /tmp/ufetch/<id>.ctl.json
+echo '{"cmd":"cancel"}' > /tmp/ufetch/<id>.ctl.json
 ```
 
 作为库使用：
@@ -84,7 +98,7 @@ x86_64 静态产物约 2.7 MB。交叉编译细节见 [USAGE.md](USAGE.md)。
 ## 目录
 
 ```
-src/            引擎、任务管理、续传、命名、限速、校验
+src/            引擎、任务表、环形缓存、设置、续传、命名、限速、校验、日志
 src/bin/        ufetch CLI
 tests/          自建 HTTP 服务端的端到端测试
 openwrt/        OpenWrt 包定义（预编译二进制 + SDK 打包）

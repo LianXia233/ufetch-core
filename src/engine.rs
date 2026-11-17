@@ -379,13 +379,7 @@ async fn run_route(
         resumed_bytes: 0,
     };
 
-    let connections = effective_connections(
-        req,
-        cfg,
-        total,
-        probe.ranges,
-        req.force_split,
-    );
+    let connections = effective_connections(req, cfg, total, probe.ranges, req.force_split);
     let connection_cap = cfg
         .max_connections
         .clamp(1, HARD_MAX_CONNECTIONS)

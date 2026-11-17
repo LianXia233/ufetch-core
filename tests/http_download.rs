@@ -507,6 +507,7 @@ fn manager(connections: u32) -> DownloadManager {
         engine,
         max_concurrent: 2,
         progress_interval: Duration::from_millis(100),
+        ..ManagerConfig::default()
     })
     .expect("manager")
 }
@@ -792,6 +793,7 @@ async fn stall_watchdog_aborts_a_silent_connection() {
         engine,
         max_concurrent: 1,
         progress_interval: Duration::from_millis(100),
+        ..ManagerConfig::default()
     })
     .expect("manager");
     let error = manager

@@ -67,7 +67,7 @@ ufetch pause|resume|cancel --control-file <PATH>
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
-| `-o, --output-dir <DIR>` | `.` | 保存目录 |
+| `-o, --output-dir <DIR>` | 缓存目录 | 保存目录 |
 | `-f, --file-name <NAME>` | 自动推断 | 指定文件名 |
 | `-n, --connections <N>` | `0` | 并发连接数；`0` = 自适应 |
 | `-l, --limit <RATE>` | 不限 | 全局限速，`512K` / `2M` |
@@ -76,14 +76,14 @@ ufetch pause|resume|cancel --control-file <PATH>
 | `--sha256 <HEX>` | — | 等价于 `--checksum sha256=<HEX>` |
 | `--force-split` | 关 | 小文件也分段 |
 | `--overwrite` | 关 | 覆盖同名文件 |
-| `--status-file <PATH>` | — | 进度 JSON |
-| `--control-file <PATH>` | — | 轮询控制 JSON |
+| `--status-file <PATH>` | `<缓存>/<id>.status.json` | 进度 JSON |
+| `--control-file <PATH>` | `<缓存>/<id>.ctl.json` | 轮询控制 JSON |
 | `--proxy <URL>` | — | `http://` / `socks5://` |
 | `--ua <UA>` | Chrome 131 | User-Agent |
 | `--stall-secs <N>` | `30` | 停滞看门狗 |
 | `--max-retries <N>` | `3` | 单段重试次数 |
 | `--max-connections <N>` | `8` | 自适应上限（硬上限 32） |
-| `--no-slow-guard` | 开 | 关闭 32 KB/s × 15 s 慢速保护 |
+| `--no-slow-guard` | — | 关闭 32 KB/s × 15 s 慢速保护 |
 | `--no-keep-partial` | 关 | 失败时删除半成品与侧车 |
 | `--insecure` | 关 | 忽略证书错误（仅调试） |
 | `--json` | 关 | 进度按 JSON 行输出 |
@@ -99,7 +99,27 @@ ufetch resume --control-file /tmp/dl/ctl.json
 ufetch cancel --control-file /tmp/dl/ctl.json
 ```
 
-等价于向控制文件写 `{"cmd":"pause"}` 等；适合脚本或 LuCI 调用。
+等价于向控制文件写 `{"cmd":"pause"}` 等。也可以按任务 ID 操作，控制文件由任务表自动给出：
+
+```bash
+ufetch pause <ID>
+ufetch resume <ID>
+ufetch cancel <ID>
+ufetch start <ID>
+```
+
+### 2.3 任务、缓存与诊断
+
+| 命令 | 作用 |
+| --- | --- |
+| `ufetch list [--json]` | 列出任务（ID、状态、百分比、大小、文件名） |
+| `ufetch status <ID> [--json]` | 查看单个任务详情与产物路径 |
+| `ufetch delete <ID> [--keep-file]` | 删除任务记录与产物；`--keep-file` 只删记录 |
+| `ufetch install-ok <ID>` | 插件安装成功后调用：删除产物、侧车、状态/控制文件与任务 |
+| `ufetch cache [list|clear]` | 查看或清空环形缓存 |
+| `ufetch config [--json]` | 查看 TOML 设置 |
+| `ufetch config set <K=V>...` | 修改设置并落盘 |
+| `ufetch log [--tail <N>]` | 查看日志尾部（默认 40 行） |
 
 ## 3. 常用场景
 
@@ -310,7 +330,101 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 `pos` 是该段已写到的位置。URL 或 `total` 变化、ETag 变化、区间返回 416 时，
 会清空重下一次。
 
-## 6. OpenWrt 集成
+## 6. 缓存、任务表与日志
+
+### 6.1 内存环形缓存
+
+默认目录：`${UFETCH_HOME:-/tmp/ufetch}`。OpenWrt 的 `/tmp` 是 tmpfs，文件本身就在内存里；
+普通机器上则是临时目录。默认双上限：
+
+| 项 | 默认 |
+| --- | --- |
+| 总字节 | 64 MiB |
+| 条目数 | 16 |
+
+每完成一个任务就登记一条；超过任一上限时删除最旧的产物。索引是 `<缓存>/cache.json`。
+下载中的临时文件仍是 `<文件名>.ufetch` 与 `.parts.json`，都放在缓存目录里。
+
+### 6.2 任务表
+
+`<缓存>/tasks.json` 保存任务记录，字段包括：
+
+```json
+{
+  "id": "1794946554892-0",
+  "url": "https://example.com/pkg.apk",
+  "file_name": "pkg.apk",
+  "state": "completed",
+  "downloaded": 4194304,
+  "total": 4194304,
+  "percent": 100.0,
+  "speed_bps": 0,
+  "connections": 6,
+  "active_connections": 0,
+  "created_at": 1794946554,
+  "updated_at": 1794946559,
+  "status_file": "/tmp/ufetch/<id>.status.json",
+  "control_file": "/tmp/ufetch/<id>.ctl.json",
+  "artifact": "/tmp/ufetch/pkg.apk",
+  "auto_remove": true
+}
+```
+
+- 下载进程在启动、每次进度 tick、终态时更新它；`ufetch list` 每次重新读盘。
+- `install-ok` 在 `auto_remove=true` 时删除记录与产物；设为 `false` 则保留，便于排查。
+- `delete` 是手动清理；`cancel` 只停任务，默认保留半成品便于续传。
+
+### 6.3 日志
+
+默认 `<缓存目录>/ufetch.log`，只保留最新 **512 KiB**：每次追加后若超限，就截掉旧内容，
+保留尾部 512 KiB。级别由 `UFETCH_LOG` 控制：
+
+```bash
+UFETCH_LOG=debug ufetch https://example.com/pkg.apk
+ufetch log --tail 80
+UFETCH_LOG_FILE=/tmp/my.log ufetch ...   # 换日志路径
+```
+
+## 7. 高级设置（settings.toml）
+
+配置文件：`<UFETCH_HOME>/settings.toml`，TOML + Serde。缺失时使用内置默认值；
+`ufetch config` 打印当前值，`ufetch config set key=value` 修改并原子写回。
+
+```toml
+cache_dir = "/tmp/ufetch"
+cache_capacity_mb = 64
+cache_max_items = 16
+max_concurrent = 3
+connections = 0
+max_connections = 8
+chunk_mb = 4
+speed_limit = "512K"
+stall_secs = 30
+max_retries = 3
+connect_timeout_secs = 20
+slow_guard = true
+auto_remove = true
+```
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `cache_dir` | `<tmp>/ufetch` | 缓存、任务表、日志目录 |
+| `cache_capacity_mb` | `64` | 环形缓存字节上限 |
+| `cache_max_items` | `16` | 环形缓存条目上限 |
+| `max_concurrent` | `3` | 同时下载任务数 |
+| `connections` | `0` | 单任务连接数，0 = 自适应 |
+| `max_connections` | `8` | 自适应上限 |
+| `chunk_mb` | `4` | 分块大小 |
+| `speed_limit` | 空 | `512K` / `2M`，空 = 不限 |
+| `stall_secs` | `30` | 停滞看门狗 |
+| `max_retries` | `3` | 单段重试 |
+| `connect_timeout_secs` | `20` | 建连超时 |
+| `slow_guard` | `true` | 32 KB/s × 15 s 慢速保护 |
+| `auto_remove` | `true` | 安装成功后自动删除任务 |
+
+命令行参数（如 `-n`、`-l`、`--stall-secs`）优先于配置文件。
+
+## 8. OpenWrt 集成
 
 `openwrt/Makefile` 采用“预编译二进制 + SDK 只打包”的方式：
 
@@ -354,7 +468,7 @@ start_service() {
 - 向 `/tmp/ufetch/ctl.json` 写 `{"cmd":"pause"}` 即可暂停，无需 ubus 接口；
 - 升级成功后由插件脚本校验 `.apk` / `.ipk` 并调用 opkg。
 
-## 7. 行为与限制
+## 9. 行为与限制
 
 - **探测**：`GET` + `Range: bytes=0-0`；206 取总大小，200 则复用该响应走单流。
 - **分段阈值**：≤ 2 MiB 默认单流；`--force-split` 可强制分段（每段 ≥ 64 KiB）。
@@ -365,7 +479,7 @@ start_service() {
 - **服务器换文件**：ETag 变化、总大小变小、416 时清空临时文件，最多重下一次。
 - **校验失败**：删除临时文件并报错，不会把坏文件改名为目标文件。
 
-## 8. 排错
+## 10. 排错
 
 | 现象 | 处理 |
 | --- | --- |
@@ -377,14 +491,14 @@ start_service() {
 | 续传后校验失败 | 删除 `.ufetch` 与 `.parts.json` 重下 |
 | 小文件只有 1 条连接 | 正常；需要演示多连接加 `--force-split` |
 
-## 9. 性能建议
+## 11. 性能建议
 
 - 路由器上 `-n 0`（自适应）+ 默认上限 8 足够；再高只会互相抢带宽。
 - 大文件用 4 MiB 分块；插件包用 `--force-split`，每段至少 64 KiB。
 - 状态文件放 `/tmp` 减少 flash 写入；需要跨重启保留才放 `/etc`。
 - 限速按出口带宽设置，不要低于 64 KB/s，否则慢速保护可能误判。
 
-## 10. 许可证
+## 12. 许可证
 
 LGPL-3.0-or-later。文本见 [LICENSE](LICENSE) 与 [LICENSE.GPL-3](LICENSE.GPL-3)。
 静态链接分发时按 LGPLv3 第 4 节提供可重新链接的方式，并保留版权与许可证声明。
