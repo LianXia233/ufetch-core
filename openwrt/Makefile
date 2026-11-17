@@ -61,8 +61,6 @@ define Package/ufetch-core/install
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(INSTALL_BIN) ./root/usr/bin/ufetch $(1)/usr/bin/ufetch
 
-	# 学习数据默认放 /tmp（重启即清）；想跨重启保留可改到 /etc/ufetch。
-	$(INSTALL_DIR) $(1)/etc/ufetch
 endef
 
 $(eval $(call BuildPackage,ufetch-core))
